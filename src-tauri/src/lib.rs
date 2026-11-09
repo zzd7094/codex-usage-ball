@@ -6,9 +6,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Window, WindowEvent};
@@ -23,6 +23,7 @@ const MENU_SHOW_SETTINGS: &str = "show_settings";
 const MENU_EXIT: &str = "exit_app";
 const WINDOW_STATE_FILE: &str = "window-positions.json";
 const RIGHT_SNAP_DISTANCE_PX: i32 = 24;
+const RATE_LIMITS_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 struct TrayState {
@@ -596,7 +597,7 @@ fn collect_stderr(rx: &mpsc::Receiver<String>) -> String {
     lines.join("\n")
 }
 
-fn spawn_codex_app_server() -> Result<std::process::Child, String> {
+fn spawn_codex_app_server() -> Result<Child, String> {
     let launcher = find_codex_launcher()?;
     let mut command = launcher.command();
     hide_child_console(&mut command);
@@ -717,10 +718,26 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[tauri::command]
-fn read_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
-    let mut child = spawn_codex_app_server()?;
+async fn read_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
+    tauri::async_runtime::spawn_blocking(query_rate_limits)
+        .await
+        .map_err(|err| format!("用量查询任务异常结束：{err}"))?
+}
 
-    let mut stdin = child
+fn query_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
+    let deadline = Instant::now() + RATE_LIMITS_TIMEOUT;
+    let mut child = spawn_codex_app_server()?;
+    let result = read_rate_limits_from_child(&mut child, deadline);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn read_rate_limits_from_child(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<GetAccountRateLimitsResponse, String> {
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| "无法写入 codex app-server 标准输入".to_string())?;
@@ -753,6 +770,15 @@ fn read_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
         }
     });
 
+    read_rate_limits_response(stdin, &stdout_rx, &stderr_rx, deadline)
+}
+
+fn read_rate_limits_response(
+    mut stdin: impl Write,
+    stdout_rx: &mpsc::Receiver<String>,
+    stderr_rx: &mpsc::Receiver<String>,
+    deadline: Instant,
+) -> Result<GetAccountRateLimitsResponse, String> {
     let initialize = jsonrpc_line(
         1,
         "initialize",
@@ -775,26 +801,23 @@ fn read_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
     let mut initialized = false;
 
     loop {
-        let line = match stdout_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(line) => line,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let stderr = collect_stderr(&stderr_rx);
+        // Notifications can arrive without the requested response. They must not extend the deadline.
+        let line = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .and_then(|remaining| stdout_rx.recv_timeout(remaining).ok());
+        let line = match line {
+            Some(line) => line,
+            None => {
+                let stderr = collect_stderr(stderr_rx);
                 if stderr.is_empty() {
                     return Err("读取 Codex 用量超时".to_string());
                 }
                 return Err(format!("读取 Codex 用量超时：{stderr}"));
             }
         };
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(message) => message,
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Codex 返回了无法解析的数据：{err}"));
-            }
-        };
+        let message: Value = serde_json::from_str(&line)
+            .map_err(|err| format!("Codex 返回了无法解析的数据：{err}"))?;
 
         if message.get("id").and_then(Value::as_i64) == Some(1) && !initialized {
             initialized = true;
@@ -807,9 +830,6 @@ fn read_rate_limits() -> Result<GetAccountRateLimitsResponse, String> {
         }
 
         if message.get("id").and_then(Value::as_i64) == Some(2) {
-            let _ = child.kill();
-            let _ = child.wait();
-
             if let Some(error) = message.get("error") {
                 return Err(format!("Codex 用量接口返回错误：{error}"));
             }
@@ -899,6 +919,24 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_messages_do_not_extend_rate_limits_deadline() {
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let (_stderr_tx, stderr_rx) = mpsc::channel();
+        for message in [
+            r#"{"id":1,"result":{}}"#,
+            r#"{"method":"test/notification"}"#,
+            r#"{"id":2,"result":{"rateLimits":{}}}"#,
+        ] {
+            stdout_tx.send(message.to_string()).unwrap();
+        }
+
+        let result =
+            read_rate_limits_response(std::io::sink(), &stdout_rx, &stderr_rx, Instant::now());
+
+        assert_eq!(result.unwrap_err(), "读取 Codex 用量超时");
+    }
 
     fn work_area() -> WorkArea {
         WorkArea {
